@@ -62,6 +62,18 @@ export default function MergePage() {
       : null
   }
 
+  // 422 input-id rejection: the server validated Base/A/B record ids before
+  // indexing and produced no merge result.  List every offending record so
+  // the user can fix the file and re-preview; the selected files stay in
+  // place (only the stale preview is dropped).
+  const describeInputIssues = (e) => {
+    const d = e?.detail
+    if (e?.status !== 422 || !d || typeof d !== 'object'
+        || !Array.isArray(d.issues)) return null
+    const lines = d.issues.map((it) => `· ${it.message}`)
+    return `${d.message || '合并输入文档的 ID 校验未通过，未生成合并结果'}\n${lines.join('\n')}`
+  }
+
   const pickBaseProject = async (pid) => {
     setBaseProjectId(pid)
     setResult(null)
@@ -119,7 +131,14 @@ export default function MergePage() {
       }
       return r
     } catch (e) {
-      if (e.status === 409 && e.detail && 'unresolved' in e.detail) {
+      if (e.status === 422 && e.detail?.issues) {
+        // Invalid input ids: no merge result exists for these inputs, so
+        // drop any stale preview (nothing may be exported / saved from it).
+        // The chosen files are kept; replacing the bad file and clicking
+        // 开始三方合并 re-runs the preview.
+        setResult(null)
+        setError(describeInputIssues(e))
+      } else if (e.status === 409 && e.detail && 'unresolved' in e.detail) {
         // Save was refused: keep the latest preview (conflicts + errors stay
         // visible) so the user can fix the adjudication and retry.
         setError(describeRejection(e))
@@ -193,9 +212,10 @@ export default function MergePage() {
         setSavedLabel(`已写回基准项目「${r.savedProject.name}」`)
       }
     } catch (e) {
+      // 422: the stored base / a copy has invalid ids — no result produced.
       // 409 with unresolved/errors: refuse to write back; the base document
       // stays unchanged. The live preview already lists the same problems.
-      setError(describeRejection(e) || e.message)
+      setError(describeInputIssues(e) || describeRejection(e) || e.message)
     } finally {
       setBusy(false)
     }

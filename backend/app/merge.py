@@ -45,6 +45,88 @@ MISSING = object()
 # (the merge module stays dependency-free).
 DEFAULT_ANN_COLOR = "#5b8def"
 
+_SIDE_LABELS = {"base": "基准 Base", "a": "离线副本 A", "b": "离线副本 B"}
+_COLLECTION_LABELS = {SEG_KEY: "转写片段（segments）", ANN_KEY: "校注（annotations）"}
+
+
+class MergeInputError(ValueError):
+    """Merge input documents carry missing / invalid / duplicate record ids.
+
+    ``issues`` is a list of dicts, one per offending record:
+    ``side`` (base/a/b), ``collection`` (segments/annotations), ``index``
+    (0-based row within the collection), ``id`` (the id involved, ``None``
+    when missing), ``problem`` (missing | empty | notString | duplicate)
+    and a ready-made human-readable ``message``.
+    """
+
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__("\n".join(
+            ["合并输入文档的 ID 校验未通过："]
+            + [it["message"] for it in issues]))
+
+
+def _id_issue(side, kind, index, item_id, problem, first_index=None):
+    where = f"{_SIDE_LABELS[side]} · {_COLLECTION_LABELS[kind]} 第 {index + 1} 条"
+    if problem == "missing":
+        msg = f"{where}：缺少 id（记录没有 id 字段或值为 null）"
+    elif problem == "empty":
+        msg = f"{where}：id 为空字符串"
+    elif problem == "notString":
+        msg = f"{where}：id 不是字符串（值：{item_id!r}）"
+    else:  # duplicate
+        msg = (f"{where}：id {item_id!r} 重复"
+               f"（首次出现于第 {first_index + 1} 条）")
+    issue = {
+        "side": side,
+        "collection": kind,
+        "index": index,
+        "id": item_id,
+        "problem": problem,
+        "message": msg,
+    }
+    if first_index is not None:
+        issue["firstIndex"] = first_index
+    return issue
+
+
+def validate_document_ids(doc, side):
+    """Collect the id problems of one side's document.
+
+    Every record id must be a non-empty string, unique within this side's
+    own collection.  ``segments`` and ``annotations`` are separate
+    collections and may reuse the same id; equal ids *across* sides are
+    exactly how the three-way comparison matches records, so they are
+    never a problem.
+    """
+    issues = []
+    for kind in (SEG_KEY, ANN_KEY):
+        seen = {}
+        for index, item in enumerate((doc or {}).get(kind) or []):
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if item_id is None:
+                issues.append(_id_issue(side, kind, index, None, "missing"))
+            elif not isinstance(item_id, str):
+                issues.append(
+                    _id_issue(side, kind, index, item_id, "notString"))
+            elif not item_id.strip():
+                issues.append(_id_issue(side, kind, index, item_id, "empty"))
+            elif item_id in seen:
+                issues.append(_id_issue(side, kind, index, item_id,
+                                        "duplicate", seen[item_id]))
+            else:
+                seen[item_id] = index
+    return issues
+
+
+def validate_merge_inputs(base_doc, a_doc, b_doc):
+    """Raise MergeInputError listing every id problem in the three inputs."""
+    issues = []
+    for side, doc in (("base", base_doc), ("a", a_doc), ("b", b_doc)):
+        issues.extend(validate_document_ids(doc, side))
+    if issues:
+        raise MergeInputError(issues)
+
 
 def _index(items):
     return {it["id"]: it for it in (items or [])}
@@ -177,8 +259,14 @@ def _interval_clusters(a_added, b_added):
 
 
 def analyze(base_doc, a_doc, b_doc):
-    """Return (changes, conflicts, stats)."""
+    """Return (changes, conflicts, stats).
+
+    Raises MergeInputError before any indexing when a record id is missing,
+    blank / non-string, or duplicated within one side's collection —
+    otherwise the id index would silently drop records or crash.
+    """
     base_doc, a_doc, b_doc = base_doc or {}, a_doc or {}, b_doc or {}
+    validate_merge_inputs(base_doc, a_doc, b_doc)
     changes = []
     conflicts = []
     stats = {

@@ -68,6 +68,9 @@ docker compose up -d --build
 
 > **http://localhost:8000**
 
+三方合并页地址：**http://localhost:8000/merge**（顶部导航「三方合并」；
+端口随 Compose / `-p` 映射调整，容器内固定 8000）。
+
 在首页打开任一项目即进入项目编辑页（`/projects/{id}`），时间轴下方依次是
 「发言时长」「接话关系」与「引语检索」面板，顶部操作区有「📦 摘录包」入口
 （`/projects/{id}/excerpts`，即 **http://localhost:8000/projects/{id}/excerpts**）、
@@ -319,10 +322,18 @@ JSON 消费方）。重新导入导出的 JSON 时，这些校注按普通校注
    （也可以直接复制项目给两位校注者，只要改动基于同一份基准。）
 2. 两人各自在**新建项目时导入自己的离线副本 JSON**，独立完成校注并保存；
    或直接编辑副本文件中的 `document`。
-3. 打开顶部「**三方合并**」页：
+3. 打开顶部「**三方合并**」页（`/merge`，即 **http://localhost:8000/merge**）：
    - 基准（Base）：下拉选择原始项目，或选择基准 JSON；
    - A、B：分别选择两人的离线副本文件；
    - 点击「开始三方合并」。
+   - **输入 ID 校验**：合并前服务端先校验 Base、A、B 各自的 `segments` 与
+     `annotations`——每条记录的 `id` 必须是非空字符串，且在**该侧该集合内
+     唯一**（跨侧相同 id 正是三方比较的依据；同侧的片段与校注分属两个集合，
+     可以各自使用同一 id）。发现 id 缺失、为空、不是字符串或重复时，整个
+     合并请求返回 **422**，响应逐条指明**侧别、集合、行序与所涉 id**
+     （缺失会注明缺失），**不生成任何可导出 / 可写回的合并结果**；合并页
+     会列出全部问题并保留已选文件，替换问题文件后重新点击「开始三方合并」
+     即可再次预览。
 4. 页面展示：
    - **自动合并的互不重叠改动**（新增 / 修改 / 删除），按片段与校注分别统计；
    - **需要逐项裁决的冲突**，每张卡片并排显示基准、A、B 三个版本。
@@ -609,7 +620,13 @@ JSON 消费方）。重新导入导出的 JSON 时，这些校注按普通校注
 ## 合并规则说明
 
 合并以条目的稳定 `id`（片段 `seg-*`、校注 `ann-*`）在 **基准 / A / B**
-三份文档中比对：
+三份文档中比对。**比对之前先校验输入**：每份文档的 `segments` 与
+`annotations` 中，每条记录的 `id` 必须是非空字符串且在该侧该集合内唯一
+（跨侧相同 id 是正常比较依据；同侧的片段集合与校注集合互不影响，可各自
+使用同一 id）。任一记录 id 缺失、为空、不是字符串或在同侧同集合内重复时，
+请求返回 **422** 并逐条给出侧别（`base` / `a` / `b`）、集合
+（`segments` / `annotations`）、行序与所涉 id（缺失注明缺失），不生成
+合并结果、不创建项目、不改写基准文档：
 
 | 情形 | 结果 |
 | --- | --- |
@@ -688,7 +705,7 @@ JSON 消费方）。重新导入导出的 JSON 时，这些校注按普通校注
 | POST | `/api/projects/{id}/quality-scans/compare` | 对比两次同窗口扫描，按 issueId 输出新增 / 已解决 / 仍存在 |
 | POST | `/api/import` | 上传文件（multipart）或 JSON 文本解析转写稿 |
 | POST | `/api/projects/{id}/import` | 导入到指定项目（保留校注） |
-| POST | `/api/merge` | 三方合并预览，可携带 `resolutions` 裁决；带 `saveAsProject` 另存或带 `projectId` 写回时，未裁决 / 裁决无效一律 **409**（不建项目、不改原文档） |
+| POST | `/api/merge` | 三方合并预览，可携带 `resolutions` 裁决；输入文档 id 缺失 / 为空 / 非字符串 / 同侧同集合重复时返回 **422**（不生成合并结果）；带 `saveAsProject` 另存或带 `projectId` 写回时，未裁决 / 裁决无效一律 **409**（不建项目、不改原文档） |
 | GET/POST | `/api/projects/{id}/rules` | 项目的规则列表 / 新建规则 |
 | GET/PUT/DELETE | `/api/rules/{id}` | 读取 / 修改 / 删除规则（删除后其校注转为手工） |
 | POST | `/api/projects/{id}/rules/preview` | 预览未保存的规则草稿 |
@@ -716,6 +733,31 @@ JSON 消费方）。重新导入导出的 JSON 时，这些校注按普通校注
 `choice` 取值：`a` / `b` / `custom`（附 `value`）/ `drop` / `keep`
 （区间冲突）/ `fields`（附字段选择）。`base` 也可省略而改用
 `projectId` 指定基准项目。
+
+**输入 ID 校验（422）**：合并前服务端先校验 Base / A / B 各自 `segments`
+与 `annotations` 的记录 id——必须是非空字符串，且在该侧该集合内唯一
+（跨侧相同 id 是三方比较的依据；同侧片段与校注分属两个集合，可各自使用
+同一 id）。任一记录违反时整个请求返回 **422**，不生成合并结果、不创建
+项目、不改写基准文档，响应体 `detail` 逐条指明问题记录：
+
+```json
+{
+  "message": "合并输入文档存在缺失、无效或重复的 ID，未生成合并结果",
+  "issues": [
+    {"side": "a", "collection": "segments", "index": 2,
+     "id": "seg-001", "problem": "duplicate", "firstIndex": 0,
+     "message": "离线副本 A · 转写片段（segments） 第 3 条：id 'seg-001' 重复（首次出现于第 1 条）"},
+    {"side": "base", "collection": "annotations", "index": 1,
+     "id": null, "problem": "missing",
+     "message": "基准 Base · 校注（annotations） 第 2 条：缺少 id（记录没有 id 字段或值为 null）"}
+  ]
+}
+```
+
+`problem` 取值：`missing`（缺少 id / 值为 null）、`empty`（空字符串）、
+`notString`（id 不是字符串）、`duplicate`（同侧同集合内重复，附
+`firstIndex` 首次出现的行序）；`index` 为从 0 开始的行序，`message`
+为可直接展示的中文说明。修正输入后重新请求即可。
 
 **预览与持久化分离**：不带 `saveAsProject` 且不带 `projectId` 时只做
 预览，响应始终包含本次合并的 `conflicts`、`unresolved`（未裁决冲突 id

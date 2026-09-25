@@ -21,7 +21,7 @@ from . import (
     rules,
     speakers,
 )
-from .merge import merge_documents
+from .merge import MergeInputError, merge_documents
 from .schemas import (
     CorrectionApplyRequest,
     CorrectionPreviewRequest,
@@ -642,7 +642,18 @@ def merge(payload: MergeRequest) -> dict:
     if payload.resolutions:
         resolutions = {k: v.model_dump() for k, v in payload.resolutions.items()}
 
-    result = merge_documents(base, _doc(payload.a), _doc(payload.b), resolutions)
+    try:
+        result = merge_documents(base, _doc(payload.a), _doc(payload.b),
+                                 resolutions)
+    except MergeInputError as exc:
+        # Missing / invalid / duplicate record ids: refuse the whole merge
+        # before any indexing, so no merge result is produced and nothing
+        # is exported, created or written back.  The 422 detail names the
+        # side, collection, row and id of every offending record.
+        raise HTTPException(status_code=422, detail={
+            "message": "合并输入文档存在缺失、无效或重复的 ID，未生成合并结果",
+            "issues": exc.issues,
+        })
 
     wants_save_as = bool(payload.saveAsProject and payload.saveAsProject.strip())
     wants_write_back = bool(payload.projectId)
