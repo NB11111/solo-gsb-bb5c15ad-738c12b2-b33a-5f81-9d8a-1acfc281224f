@@ -13,6 +13,17 @@ edit offline, and their copies are merged:
 * each conflict is adjudicated per item; resolutions may pick a side,
   supply a custom value, drop the item(s), or (interval only) keep all.
 
+Before any index is built the three input documents are validated
+(:func:`validate_documents`): every item id must be a non-empty string,
+unique within its own side + collection — otherwise later items with the
+same id would silently overwrite earlier ones in the index (records lost)
+or a missing id would crash the merge.  Validation raises
+:class:`MergeInputError` listing side, collection, row and id of every
+problem, and no merge result is produced.  The same id across sides is
+exactly how items are matched, and a segment and an annotation on the
+same side may share an id — only duplicates *within* one side's
+collection are rejected, along with missing / non-string ids.
+
 Beyond the core fields (``start`` / ``end`` / ``speaker`` / ``text`` /
 ``topic`` / ``note``) annotations carry optional rule provenance fields —
 ``color``, ``source``, ``ruleId``, ``ruleSlot``, ``ruleName``.  They take
@@ -44,6 +55,101 @@ MISSING = object()
 # Kept in sync with rules.DEFAULT_COLOR without importing the rule engine
 # (the merge module stays dependency-free).
 DEFAULT_ANN_COLOR = "#5b8def"
+
+# Side / collection labels used in the input-validation error messages.
+SIDE_LABELS = {"base": "基准（Base）", "a": "副本 A", "b": "副本 B"}
+COLLECTION_LABELS = {SEG_KEY: "segments（片段）",
+                     ANN_KEY: "annotations（校注）"}
+
+
+class MergeInputError(ValueError):
+    """Invalid item ids in the merge input documents.
+
+    ``problems`` is a list of dicts::
+
+        {"side": "base" | "a" | "b",
+         "collection": "segments" | "annotations",
+         "reason": "missing" | "invalid" | "duplicate",
+         "indexes": [<0-based row>, ...],
+         "id": <the repeated / ill-typed id> or None}
+
+    Raised before any index is built: an input with duplicate or missing
+    ids must never silently lose records or crash the merge, and no merge
+    result is produced for it.
+    """
+
+    def __init__(self, problems):
+        self.problems = problems
+        super().__init__(_describe_input_problems(problems))
+
+
+def _describe_input_problems(problems):
+    lines = ["输入文档存在无效的记录 ID，未执行合并（不会生成合并结果）："]
+    for p in problems:
+        rows = "、".join(str(i + 1) for i in p["indexes"])
+        where = (f"{SIDE_LABELS[p['side']]} 的 "
+                 f"{COLLECTION_LABELS[p['collection']]}第 {rows} 条")
+        if p["reason"] == "duplicate":
+            lines.append(
+                f"{where}：ID「{p['id']}」重复（同一侧的同类记录中 ID 必须唯一）")
+        elif p["reason"] == "invalid":
+            lines.append(
+                f"{where}：ID 必须是非空字符串，实际值为 {p['id']!r}")
+        else:
+            lines.append(
+                f"{where}：记录 ID 缺失或为空（每条记录必须携带非空字符串 ID）")
+    return "\n".join(lines)
+
+
+def _validate_side_ids(doc, side):
+    """Id problems within one side's own segments / annotations."""
+    problems = []
+    for kind in (SEG_KEY, ANN_KEY):
+        items = (doc or {}).get(kind) or []
+        first_row = {}
+        duplicates = {}
+        for i, item in enumerate(items):
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if item_id is None or (
+                    isinstance(item_id, str) and not item_id.strip()):
+                problems.append({
+                    "side": side, "collection": kind, "reason": "missing",
+                    "indexes": [i], "id": None,
+                })
+            elif not isinstance(item_id, str):
+                problems.append({
+                    "side": side, "collection": kind, "reason": "invalid",
+                    "indexes": [i], "id": item_id,
+                })
+            elif item_id in first_row:
+                dup = duplicates.get(item_id)
+                if dup is None:
+                    dup = duplicates[item_id] = {
+                        "side": side, "collection": kind,
+                        "reason": "duplicate",
+                        "indexes": [first_row[item_id]], "id": item_id,
+                    }
+                dup["indexes"].append(i)
+            else:
+                first_row[item_id] = i
+        problems.extend(duplicates.values())
+    return problems
+
+
+def validate_documents(base_doc, a_doc, b_doc):
+    """Validate item ids of all three sides before any index is built.
+
+    Every segment / annotation id must be a non-empty string, unique
+    within its own side + collection.  The same id across sides (the
+    normal case — that is how items are matched) or shared between a
+    side's segments and its annotations stays valid.  Raises
+    :class:`MergeInputError` listing every problem found.
+    """
+    problems = []
+    for side, doc in (("base", base_doc), ("a", a_doc), ("b", b_doc)):
+        problems.extend(_validate_side_ids(doc, side))
+    if problems:
+        raise MergeInputError(problems)
 
 
 def _index(items):
@@ -179,6 +285,9 @@ def _interval_clusters(a_added, b_added):
 def analyze(base_doc, a_doc, b_doc):
     """Return (changes, conflicts, stats)."""
     base_doc, a_doc, b_doc = base_doc or {}, a_doc or {}, b_doc or {}
+    # Reject duplicate / missing ids up front: indexing would otherwise
+    # silently drop records or crash.  No merge result is produced.
+    validate_documents(base_doc, a_doc, b_doc)
     changes = []
     conflicts = []
     stats = {

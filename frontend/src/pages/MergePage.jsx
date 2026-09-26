@@ -28,6 +28,12 @@ const STAT_LABELS = {
   annotations: '校注',
 }
 
+const SIDE_LABELS = { base: '基准（Base）', a: '副本 A', b: '副本 B' }
+const COLLECTION_LABELS = {
+  segments: 'segments（片段）',
+  annotations: 'annotations（校注）',
+}
+
 export default function MergePage() {
   const [projects, setProjects] = useState([])
   const [baseProjectId, setBaseProjectId] = useState('')
@@ -60,6 +66,28 @@ export default function MergePage() {
     return lines.length
       ? `${d.message || '存在未裁决冲突或无效裁决，未保存'}\n${lines.join('\n')}`
       : null
+  }
+
+  // 422: an input document has duplicate / missing record ids.  Render
+  // every problem (side, collection, row, id) so the user can fix the
+  // file; the selected files stay in place and a corrected file can be
+  // picked and previewed again right away.
+  const describeInvalidInput = (e) => {
+    const d = e?.detail
+    if (e?.status !== 422 || !d || typeof d !== 'object'
+        || !Array.isArray(d.problems)) return null
+    const lines = d.problems.map((p) => {
+      const rows = `第 ${(p.indexes || []).map((i) => i + 1).join('、')} 条`
+      const where = `${SIDE_LABELS[p.side] || p.side} 的 ` +
+        `${COLLECTION_LABELS[p.collection] || p.collection}${rows}`
+      if (p.reason === 'duplicate') return `${where}：ID「${p.id}」重复`
+      if (p.reason === 'invalid') {
+        return `${where}：ID 必须是非空字符串（实际为 ${JSON.stringify(p.id)}）`
+      }
+      return `${where}：记录 ID 缺失或为空`
+    })
+    return ['输入文档存在无效的记录 ID，未执行合并（不会生成合并结果）；' +
+      '请修正对应文件后重新选择并再次预览：', ...lines].join('\n')
   }
 
   const pickBaseProject = async (pid) => {
@@ -119,7 +147,14 @@ export default function MergePage() {
       }
       return r
     } catch (e) {
-      if (e.status === 409 && e.detail && 'unresolved' in e.detail) {
+      const invalidInput = describeInvalidInput(e)
+      if (invalidInput) {
+        // 422: the inputs themselves are invalid — the server produced no
+        // merge result, so drop any stale preview (nothing to export or
+        // write back).  The selected files are kept for replacement.
+        setResult(null)
+        setError(invalidInput)
+      } else if (e.status === 409 && e.detail && 'unresolved' in e.detail) {
         // Save was refused: keep the latest preview (conflicts + errors stay
         // visible) so the user can fix the adjudication and retry.
         setError(describeRejection(e))
@@ -195,7 +230,11 @@ export default function MergePage() {
     } catch (e) {
       // 409 with unresolved/errors: refuse to write back; the base document
       // stays unchanged. The live preview already lists the same problems.
-      setError(describeRejection(e) || e.message)
+      // 422: the (re-read) base document or a copy has invalid record ids —
+      // no merge result exists, so drop the stale preview as well.
+      const invalidInput = describeInvalidInput(e)
+      if (invalidInput) setResult(null)
+      setError(invalidInput || describeRejection(e) || e.message)
     } finally {
       setBusy(false)
     }

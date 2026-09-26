@@ -21,7 +21,7 @@ from . import (
     rules,
     speakers,
 )
-from .merge import merge_documents
+from .merge import MergeInputError, merge_documents
 from .schemas import (
     CorrectionApplyRequest,
     CorrectionPreviewRequest,
@@ -642,7 +642,18 @@ def merge(payload: MergeRequest) -> dict:
     if payload.resolutions:
         resolutions = {k: v.model_dump() for k, v in payload.resolutions.items()}
 
-    result = merge_documents(base, _doc(payload.a), _doc(payload.b), resolutions)
+    try:
+        result = merge_documents(base, _doc(payload.a), _doc(payload.b),
+                                 resolutions)
+    except MergeInputError as exc:
+        # Invalid item ids in any input document (Base / A / B): refuse the
+        # whole merge with 422 — no merge result is produced, so nothing
+        # can be exported, saved as a project or written back.  The detail
+        # names the side, collection, row(s) and id of every problem.
+        raise HTTPException(status_code=422, detail={
+            "message": str(exc),
+            "problems": exc.problems,
+        })
 
     wants_save_as = bool(payload.saveAsProject and payload.saveAsProject.strip())
     wants_write_back = bool(payload.projectId)

@@ -1,7 +1,15 @@
 """Tests for the three-way merge logic. Run: python -m pytest backend/"""
 import copy
 
-from app.merge import analyze, build_merged, merge_documents
+import pytest
+
+from app.merge import (
+    MergeInputError,
+    analyze,
+    build_merged,
+    merge_documents,
+    validate_documents,
+)
 
 SEG = lambda sid, s, e, sp="", t="x": {
     "id": sid, "start": s, "end": e, "speaker": sp, "text": t}
@@ -426,3 +434,107 @@ def test_detached_annotation_provenance_protects_on_rule_rerun():
     manual = next(x for x in final if x["id"] == "n1")
     assert "source" not in manual and manual["color"] == "#e36b6b"
     assert plan["proposed"][0]["id"] != "n1"
+
+
+# ---------- input id validation (before any index is built) ----------
+
+def test_duplicate_segment_ids_within_one_side_are_rejected():
+    base = doc([SEG("s1", 0, 1), SEG("s2", 1, 2), SEG("s1", 2, 3)])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(base, doc(), doc())
+    (p,) = excinfo.value.problems
+    assert p["side"] == "base" and p["collection"] == "segments"
+    assert p["reason"] == "duplicate" and p["id"] == "s1"
+    assert p["indexes"] == [0, 2]  # every row carrying the repeated id
+    assert "基准" in str(excinfo.value) and "s1" in str(excinfo.value)
+
+
+def test_duplicate_annotation_ids_on_side_b_report_all_rows():
+    b = doc(anns=[ANN("n1", 0, 1), ANN("n2", 1, 2), ANN("n1", 2, 3),
+                  ANN("n1", 3, 4)])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(doc(), doc(), b)
+    (p,) = excinfo.value.problems
+    assert p["side"] == "b" and p["collection"] == "annotations"
+    assert p["reason"] == "duplicate"
+    assert p["indexes"] == [0, 2, 3] and p["id"] == "n1"
+
+
+def test_missing_id_is_reported_as_missing():
+    a = doc([SEG("s1", 0, 1), {"start": 1, "end": 2, "text": "no id"}])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(doc(), a, doc())
+    (p,) = excinfo.value.problems
+    assert p["side"] == "a" and p["collection"] == "segments"
+    assert p["reason"] == "missing" and p["id"] is None
+    assert p["indexes"] == [1]
+    assert "缺失" in str(excinfo.value)
+
+
+def test_empty_blank_and_null_ids_count_as_missing():
+    a = doc(anns=[ANN("", 0, 1), ANN("   ", 1, 2),
+                  {"id": None, "start": 2, "end": 3}])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(doc(), a, doc())
+    assert [p["reason"] for p in excinfo.value.problems] == ["missing"] * 3
+    assert [p["indexes"] for p in excinfo.value.problems] == [[0], [1], [2]]
+
+
+def test_non_string_id_is_invalid_not_missing():
+    b = doc([SEG(7, 0, 1)])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(doc(), doc(), b)
+    (p,) = excinfo.value.problems
+    assert p["reason"] == "invalid" and p["id"] == 7
+    assert p["indexes"] == [0]
+
+
+def test_non_dict_item_counts_as_missing_id():
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(doc(["not-a-dict"]), doc(), doc())
+    (p,) = excinfo.value.problems
+    assert p["reason"] == "missing" and p["indexes"] == [0]
+
+
+def test_problems_from_all_sides_and_collections_are_aggregated():
+    base = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    a = doc(anns=[{"start": 0, "end": 1}])
+    b = doc([SEG("s9", 0, 1), SEG("s9", 1, 2)])
+    with pytest.raises(MergeInputError) as excinfo:
+        merge_documents(base, a, b)
+    keys = {(p["side"], p["collection"], p["reason"])
+            for p in excinfo.value.problems}
+    assert keys == {("base", "segments", "duplicate"),
+                    ("a", "annotations", "missing"),
+                    ("b", "segments", "duplicate")}
+
+
+def test_same_id_across_sides_still_matches_for_comparison():
+    # the normal case: identical ids across Base / A / B are how items are
+    # matched — never a validation error
+    base = doc([SEG("s1", 0, 1, "A", "x")], [ANN("n1", 0, 1)])
+    a = doc([SEG("s1", 0, 1, "Alice", "x")], [ANN("n1", 0, 1, topic="t")])
+    b = doc([SEG("s1", 0, 1, "A", "x")], [ANN("n1", 0, 1, topic="t")])
+    r = merge_documents(base, a, b)
+    assert r["conflicts"] == []
+    assert r["document"]["segments"][0]["speaker"] == "Alice"
+    assert r["document"]["annotations"][0]["topic"] == "t"
+
+
+def test_segment_and_annotation_may_share_an_id_on_the_same_side():
+    base = doc([SEG("x", 0, 1)], [ANN("x", 0, 1)])
+    r = merge_documents(base, base, copy.deepcopy(base))
+    assert r["conflicts"] == []
+    assert r["document"]["segments"][0]["id"] == "x"
+    assert r["document"]["annotations"][0]["id"] == "x"
+
+
+def test_validate_documents_raises_nothing_for_valid_inputs():
+    validate_documents(doc([SEG("s1", 0, 1)]), doc([SEG("s1", 0, 1)]),
+                       doc([SEG("s2", 0, 1)]))
+    validate_documents(None, None, None)  # empty docs are valid
+
+
+def test_analyze_also_validates_before_indexing():
+    with pytest.raises(MergeInputError):
+        analyze(doc([SEG("s1", 0, 1), SEG("s1", 1, 2)]), doc(), doc())

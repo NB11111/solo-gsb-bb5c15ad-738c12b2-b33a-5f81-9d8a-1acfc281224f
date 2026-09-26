@@ -277,3 +277,101 @@ def test_write_back_keeps_detach_and_color_then_rule_rerun_keeps_manual(client):
     assert "source" not in ids["an1"]
     assert any(a.get("source") == "rule" and a["id"] != "an1"
                for a in rerun["document"]["annotations"])
+
+
+# ---------- invalid input ids -> 422, no merge result ----------
+
+def test_duplicate_ids_in_a_copy_return_422_with_problem_details(client):
+    base = doc([SEG("s1", 0, 1, "A", "hello")])
+    a = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    b = doc([SEG("s1", 0, 1, "B", "hello")])
+    r = client.post("/api/merge", json={"base": base, "a": a, "b": b})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "未执行合并" in detail["message"]
+    (p,) = detail["problems"]
+    assert p["side"] == "a" and p["collection"] == "segments"
+    assert p["reason"] == "duplicate" and p["id"] == "s1"
+    assert p["indexes"] == [0, 1]
+    # the message names side, collection, row and id
+    assert "副本 A" in detail["message"]
+    assert "segments" in detail["message"]
+    assert "第 1、2 条" in detail["message"]
+    assert "s1" in detail["message"]
+
+
+def test_missing_id_returns_422_and_says_missing(client):
+    base, _, b = make_conflict_docs()
+    a = doc([{"start": 0, "end": 1, "speaker": "A", "text": "no id"}])
+    r = client.post("/api/merge", json={"base": base, "a": a, "b": b})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    (p,) = detail["problems"]
+    assert p["reason"] == "missing" and p["id"] is None
+    assert p["side"] == "a" and p["indexes"] == [0]
+    assert "缺失" in detail["message"]
+
+
+def test_duplicate_ids_in_base_document_return_422(client):
+    base = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    _, a, b = make_conflict_docs()
+    r = client.post("/api/merge", json={"base": base, "a": a, "b": b})
+    assert r.status_code == 422
+    (p,) = r.json()["detail"]["problems"]
+    assert p["side"] == "base" and p["reason"] == "duplicate"
+
+
+def test_422_save_as_creates_no_project(client):
+    before = client.get("/api/projects").json()
+    a = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    r = client.post("/api/merge", json={
+        "base": doc(), "a": a, "b": doc(), "saveAsProject": "不应创建"})
+    assert r.status_code == 422
+    after = client.get("/api/projects").json()
+    assert [p["id"] for p in after] == [p["id"] for p in before]
+
+
+def test_422_write_back_leaves_base_project_untouched(client):
+    created = db.create_project("基准-无效输入", doc([SEG("s1", 0, 1, "A", "x")]))
+    pid = created["id"]
+    before = db.get_project(pid)
+    a = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    r = client.post("/api/merge", json={
+        "projectId": pid, "a": a, "b": doc([SEG("s1", 0, 1, "B", "y")])})
+    assert r.status_code == 422
+    after = db.get_project(pid)
+    assert after["updatedAt"] == before["updatedAt"]
+    assert after["document"] == before["document"]
+
+
+def test_same_id_across_sides_and_kinds_is_valid_input(client):
+    # identical ids across Base / A / B are how items are matched; a segment
+    # and an annotation on the same side may also share an id
+    base = {"segments": [SEG("s1", 0, 1, "A", "x")],
+            "annotations": [{"id": "s1", "start": 0, "end": 1,
+                             "speaker": "A", "topic": "", "note": ""}]}
+    a = {"segments": [SEG("s1", 0, 1, "Alice", "x")],
+         "annotations": [{"id": "s1", "start": 0, "end": 1,
+                          "speaker": "A", "topic": "", "note": ""}]}
+    b = {"segments": [SEG("s1", 0, 1, "A", "x")],
+         "annotations": [{"id": "s1", "start": 0, "end": 1,
+                          "speaker": "A", "topic": "", "note": ""}]}
+    r = client.post("/api/merge", json={"base": base, "a": a, "b": b})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["conflicts"] == []
+    assert data["document"]["segments"][0]["speaker"] == "Alice"
+
+
+def test_fixing_the_file_allows_repreview(client):
+    base = doc([SEG("s1", 0, 1, "A", "hello")])
+    bad_a = doc([SEG("s1", 0, 1), SEG("s1", 1, 2)])
+    b = doc([SEG("s1", 0, 1, "B", "hello")])
+    bad = client.post("/api/merge", json={"base": base, "a": bad_a, "b": b})
+    assert bad.status_code == 422
+    # same request with the duplicate removed previews normally
+    good_a = doc([SEG("s1", 0, 1), SEG("s2", 1, 2)])
+    good = client.post("/api/merge",
+                       json={"base": base, "a": good_a, "b": b})
+    assert good.status_code == 200
+    assert good.json()["stats"]["segments"]["added"] == 1
